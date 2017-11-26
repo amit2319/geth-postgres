@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"database/sql"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
@@ -29,16 +31,51 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
+	"github.com/lib/pq"
 
 	gometrics "github.com/rcrowley/go-metrics"
 )
 
+const (
+  host     = "localhost"
+  port     = 5432
+  user     = "postgres"
+  password = "your-password"
+  dbname   = "calhounio_demo"
+)
+
 var OpenFileLimit = 64
 
-type LDBDatabase struct {
-	fn string      // filename for reporting
-	db *leveldb.DB // LevelDB instance
+type DB struct {
+  	driver driver.Driver
+  	dsn    string
+  	// numClosed is an atomic counter which represents a total number of
+  	// closed connections. Stmt.openStmt checks it before cleaning closed
+  	// connections in Stmt.css.
+  	numClosed uint64
 
+  	mu           sync.Mutex // protects following fields
+  	freeConn     []*driverConn
+  	connRequests map[uint64]chan connRequest
+  	nextRequest  uint64 // Next key to use in connRequests.
+  	numOpen      int    // number of opened and pending open connections
+  	// Used to signal the need for new connections
+  	// a goroutine running connectionOpener() reads on this chan and
+  	// maybeOpenNewConnections sends on the chan (one send per needed connection)
+  	// It is closed during db.Close(). The close tells the connectionOpener
+  	// goroutine to exit.
+  	openerCh    chan struct{}
+  	closed      bool
+  	dep         map[finalCloser]depSet
+  	lastPut     map[*driverConn]string // stacktrace of last conn's put; debug only
+  	maxIdle     int                    // zero means defaultMaxIdleConns; negative means 0
+  	maxOpen     int                    // <= 0 means unlimited
+  	maxLifetime time.Duration          // maximum amount of time a connection may be reused
+  	cleanerCh   chan struct{}
+}
+type PostgresDatabase struct {
+	// fn string      // filename for reporting
+	db *DB
 	getTimer       gometrics.Timer // Timer for measuring the database get request counts and latencies
 	putTimer       gometrics.Timer // Timer for measuring the database put request counts and latencies
 	delTimer       gometrics.Timer // Timer for measuring the database delete request counts and latencies
@@ -52,40 +89,28 @@ type LDBDatabase struct {
 	quitLock sync.Mutex      // Mutex protecting the quit channel access
 	quitChan chan chan error // Quit channel to stop the metrics collection before closing the database
 
-	log log.Logger // Contextual logger tracking the database path
+	// log log.Logger // Contextual logger tracking the database path
 }
 
 // NewLDBDatabase returns a LevelDB wrapped object.
-func NewLDBDatabase(file string, cache int, handles int) (*LDBDatabase, error) {
-	logger := log.New("database", file)
+func NewPostgresDatabase() (*PostgresDatabase, error) {
 
-	// Ensure we have some minimal caching and file guarantees
-	if cache < 16 {
-		cache = 16
-	}
-	if handles < 16 {
-		handles = 16
-	}
-	logger.Info("Allocated cache and file handles", "cache", cache, "handles", handles)
+	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s "+
+    "password=%s dbname=%s sslmode=disable",
+    host, port, user, password, dbname)
+  db, err := sql.Open("postgres", psqlInfo)
+  if err != nil {
+    return nil,err
+  }
+  defer db.Close()
 
-	// Open the db and recover any potential corruptions
-	db, err := leveldb.OpenFile(file, &opt.Options{
-		OpenFilesCacheCapacity: handles,
-		BlockCacheCapacity:     cache / 2 * opt.MiB,
-		WriteBuffer:            cache / 4 * opt.MiB, // Two of these are used internally
-		Filter:                 filter.NewBloomFilter(10),
-	})
-	if _, corrupted := err.(*errors.ErrCorrupted); corrupted {
-		db, err = leveldb.RecoverFile(file, nil)
-	}
-	// (Re)check for errors and abort if opening of the db failed
-	if err != nil {
-		return nil, err
-	}
-	return &LDBDatabase{
-		fn:  file,
-		db:  db,
-		log: logger,
+  err = db.Ping()
+  if err != nil {
+    return nil,err
+  }
+
+	return &PostgresDatabase{
+		db:  db
 	}, nil
 }
 
@@ -95,7 +120,7 @@ func (db *LDBDatabase) Path() string {
 }
 
 // Put puts the given key / value to the queue
-func (db *LDBDatabase) Put(key []byte, value []byte) error {
+func (db *PostgresDatabase) Put(key []byte, value []byte) error {
 	// Measure the database put latency, if requested
 	if db.putTimer != nil {
 		defer db.putTimer.UpdateSince(time.Now())
@@ -114,7 +139,7 @@ func (db *LDBDatabase) Has(key []byte) (bool, error) {
 }
 
 // Get returns the given key if it's present.
-func (db *LDBDatabase) Get(key []byte) ([]byte, error) {
+func (db *PostgresDatabase) Get(key []byte) ([]byte, error) {
 	// Measure the database get latency, if requested
 	if db.getTimer != nil {
 		defer db.getTimer.UpdateSince(time.Now())
