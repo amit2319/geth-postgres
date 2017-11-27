@@ -46,33 +46,6 @@ const (
 
 var OpenFileLimit = 64
 
-type DB struct {
-  	driver driver.Driver
-  	dsn    string
-  	// numClosed is an atomic counter which represents a total number of
-  	// closed connections. Stmt.openStmt checks it before cleaning closed
-  	// connections in Stmt.css.
-  	numClosed uint64
-
-  	mu           sync.Mutex // protects following fields
-  	freeConn     []*driverConn
-  	connRequests map[uint64]chan connRequest
-  	nextRequest  uint64 // Next key to use in connRequests.
-  	numOpen      int    // number of opened and pending open connections
-  	// Used to signal the need for new connections
-  	// a goroutine running connectionOpener() reads on this chan and
-  	// maybeOpenNewConnections sends on the chan (one send per needed connection)
-  	// It is closed during db.Close(). The close tells the connectionOpener
-  	// goroutine to exit.
-  	openerCh    chan struct{}
-  	closed      bool
-  	dep         map[finalCloser]depSet
-  	lastPut     map[*driverConn]string // stacktrace of last conn's put; debug only
-  	maxIdle     int                    // zero means defaultMaxIdleConns; negative means 0
-  	maxOpen     int                    // <= 0 means unlimited
-  	maxLifetime time.Duration          // maximum amount of time a connection may be reused
-  	cleanerCh   chan struct{}
-}
 type PostgresDatabase struct {
 	// fn string      // filename for reporting
 	db *DB
