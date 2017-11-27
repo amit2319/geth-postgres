@@ -32,18 +32,21 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/lib/pq"
+	"github.com/jinzhu/gorm"
 
 	gometrics "github.com/rcrowley/go-metrics"
 )
-
-const (
-  host     = "localhost"
-  port     = 5432
-  user     = "postgres"
-  password = "your-password"
-  dbname   = "calhounio_demo"
-)
-
+//
+// // const (
+// //   host     = "localhost"
+// //   port     = 5432
+// //   user     = "postgres"
+// //   password = "your-password"
+// //   dbname   = "calhounio_demo"
+// // )
+//
+// var defaultConnConfig = &pgx.ConnConfig{Host: "127.0.0.1", User: "pgx_md5", Password: "secret", Database: "pgx_test"}
+var defaultConnConfig = {"postgres","user=gorm DB.name=gorm sslmode=disable"}
 var OpenFileLimit = 64
 
 type PostgresDatabase struct {
@@ -64,23 +67,24 @@ type PostgresDatabase struct {
 
 	// log log.Logger // Contextual logger tracking the database path
 }
+type KvPair struct {
+	gorm.Model
+	key []byte `sql:"type:JSONB NOT NULL DEFAULT '{}'::JSONB" gorm:"primary_key"`
+	value  []byte `sql:"type:JSONB NOT NULL DEFAULT '{}'::JSONB"`
+}
 
 // NewLDBDatabase returns a LevelDB wrapped object.
 func NewPostgresDatabase() (*PostgresDatabase, error) {
 
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s "+
-    "password=%s dbname=%s sslmode=disable",
-    host, port, user, password, dbname)
-  db, err := sql.Open("postgres", psqlInfo)
-  if err != nil {
-    return nil,err
-  }
-  defer db.Close()
+	db, err := gorm.Open(*defaultConnConfig)
+	if err != nil {
+		panic(err)
+		return nil,err
+	}
 
-  err = db.Ping()
-  if err != nil {
-    return nil,err
-  }
+	// AutoMigrate
+	db.DropTable(&KvPair{})
+	db.Debug().AutoMigrate(&KvPair{})
 
 	return &PostgresDatabase{
 		db:  db
@@ -104,12 +108,17 @@ func (db *PostgresDatabase) Put(key []byte, value []byte) error {
 	if db.writeMeter != nil {
 		db.writeMeter.Mark(int64(len(value)))
 	}
-	return db.db.Put(key, value, nil)
+
+	//JSON to insert
+	KEY := key
+	VAL := value
+	kvpair = KvPair(key:KEY,value:VAL)
+	return db.db.Save(&kvpair)
 }
 
-func (db *LDBDatabase) Has(key []byte) (bool, error) {
-	return db.db.Has(key, nil)
-}
+// func (db *LDBDatabase) Has(key []byte) (bool, error) {
+// 	return db.db.Has(key, nil)
+// }
 
 // Get returns the given key if it's present.
 func (db *PostgresDatabase) Get(key []byte) ([]byte, error) {
@@ -118,7 +127,8 @@ func (db *PostgresDatabase) Get(key []byte) ([]byte, error) {
 		defer db.getTimer.UpdateSince(time.Now())
 	}
 	// Retrieve the key and increment the miss counter if not found
-	dat, err := db.db.Get(key, nil)
+	var result KvPair
+	dat, err := db.db.First(&KvPair,key)
 	if err != nil {
 		if db.missMeter != nil {
 			db.missMeter.Mark(1)
@@ -129,7 +139,7 @@ func (db *PostgresDatabase) Get(key []byte) ([]byte, error) {
 	if db.readMeter != nil {
 		db.readMeter.Mark(int64(len(dat)))
 	}
-	return dat, nil
+	return dat.value, nil
 	//return rle.Decompress(dat)
 }
 
